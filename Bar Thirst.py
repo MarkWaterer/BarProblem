@@ -74,25 +74,54 @@ def solve_fp_forward(u_field, m_initial):
         m_curr = m[n, :]
         u_curr = u_field[n, :]
         
+        # 1. Calculate Velocity from HJB gradients
         d_u_dx = np.zeros_like(u_curr)
         d_u_dx[1:-1] = (u_curr[2:] - u_curr[:-2]) / (2 * dx)
         
+        # Force zero velocity at boundaries (Reflecting condition)
+        d_u_dx[0] = 0
+        d_u_dx[-1] = 0
+        
         cfl = 0.8 * (dx / dt)
         velocity = np.clip(-d_u_dx, -cfl, cfl)
-        flux = m_curr * velocity
         
-        d_flux_dx = np.zeros_like(m_curr)
-        for i in range(1, cfg.NX - 1):
-            if velocity[i] > 0:
-                d_flux_dx[i] = (flux[i] - flux[i-1]) / dx
+        # 2. Calculate Fluxes at Cell Faces
+        # Flux[i] is the flow between cell i-1 and cell i
+        flux = np.zeros(cfg.NX + 1)
+        
+        for i in range(1, cfg.NX):
+            v_face = 0.5 * (velocity[i] + velocity[i-1])
+            
+            # Upwind scheme
+            if v_face > 0:
+                val = m_curr[i-1]
             else:
-                d_flux_dx[i] = (flux[i+1] - flux[i]) / dx
+                val = m_curr[i]
                 
+            flux[i] = val * v_face
+
+        # Strict Reflecting Boundaries: No flow in or out of the domain
+        flux[0] = 0.0
+        flux[-1] = 0.0 
+        
+        # 3. Advection Update
+        advection_term = np.zeros_like(m_curr)
+        for i in range(cfg.NX):
+            # Net flux into cell i
+            advection_term[i] = -(flux[i+1] - flux[i]) / dx
+
+        # 4. Diffusion Update
         d2_m_dx2 = np.zeros_like(m_curr)
         d2_m_dx2[1:-1] = (m_curr[2:] - 2 * m_curr[1:-1] + m_curr[:-2]) / (dx**2)
         
-        m[n + 1, :] = m_curr + dt * (-d_flux_dx + cfg.NU * d2_m_dx2)
+        # Mirror boundaries for diffusion (Neumann)
+        d2_m_dx2[0] = 2 * (m_curr[1] - m_curr[0]) / (dx**2)
+        d2_m_dx2[-1] = 2 * (m_curr[-2] - m_curr[-1]) / (dx**2)
         
+        # 5. Step Update
+        m[n + 1, :] = m_curr + dt * (advection_term + cfg.NU * d2_m_dx2)
+        
+        # Mass Conservation
         m[n + 1, :] = np.maximum(m[n + 1, :], 0)
         mass = np.sum(m[n + 1, :]) * dx_val
         if mass > 1e-9: m[n + 1, :] /= mass
@@ -104,12 +133,20 @@ m = np.zeros((cfg.NT, cfg.NX))
 m_initial = get_initial_distribution(x_grid)
 u_terminal = get_terminal_cost(x_grid)
 
+# Initialize guess
 for n in range(cfg.NT): m[n, :] = m_initial
 
 for i in range(cfg.MAX_ITER):
     m_old = m.copy()
+    
+    # Solve HJB (Backward)
     u = solve_hjb_backward(m, u_terminal)
-    m = (1 - cfg.ALPHA) * m_old + cfg.ALPHA * solve_fp_forward(u, m_initial)
+    
+    # Solve FP (Forward) - NOW USING CORRECTED FUNCTION
+    m_new = solve_fp_forward(u, m_initial)
+    
+    # Update with smoothing
+    m = (1 - cfg.ALPHA) * m_old + cfg.ALPHA * m_new
     
     diff = np.max(np.abs(m - m_old))
     if i % 10 == 0: print(f"Iter {i}: Diff = {diff:.6f}")
@@ -118,6 +155,7 @@ for i in range(cfg.MAX_ITER):
 print(f"Start Mass: {np.sum(m[0, :])*dx:.4f}")
 print(f"End Mass:   {np.sum(m[-1, :])*dx:.4f}")
 
+# Plotting
 plt.figure(figsize=(14, 10))
 
 plt.subplot(2, 2, 1)
