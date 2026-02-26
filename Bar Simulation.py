@@ -17,6 +17,8 @@ class Configuration:
     MAX_ITER = 100
     ALPHA = 0.03 
 
+    GAMMA = 0.0001
+
 cfg = Configuration()
 
 dt = (cfg.T_MAX - cfg.T_MIN) / cfg.NT
@@ -52,7 +54,7 @@ def solve_hjb_backward(m_field, u_terminal):
         d_u_dx = np.clip(d_u_dx, -max_grad, max_grad)
         hamiltonian = 0.5 * (d_u_dx**2)
         
-        congestion = cfg.XI * m_field[n+1, :]
+        congestion = cfg.XI * m_field[n+1, :] - cfg.GAMMA * m_field[n+1,:]**-6
         
         change = -hamiltonian + cfg.NU * d2_u_dx2 + congestion + running_cost_grid
         
