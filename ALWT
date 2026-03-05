@@ -1,0 +1,241 @@
+#Al brownian and thirst
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+class Configuration:
+    X_MIN, X_MAX = -2.0, 2.0
+    T_MIN, T_MAX = 0.0, 3.0
+    
+    NX = 81
+    NT = 1500
+
+    NU = 0.015
+    XI = 25.0
+
+    C_TERM = 2.0
+    C_RUN = 1.0
+    
+    ZETA = 8.0
+    K = 3.0
+
+    MAX_ITER = 100
+    ALPHA = 0.03
+
+    SIGMA_AL = 0.5 # Brownian Volativity
+    Y0 = -0.67 # Al's starting position
+
+cfg = Configuration()
+
+dt = (cfg.T_MAX - cfg.T_MIN) / cfg.NT
+dx = (cfg.X_MAX - cfg.X_MIN) / (cfg.NX - 1)
+x_grid = np.linspace(cfg.X_MIN, cfg.X_MAX, cfg.NX)
+
+def get_terminal_cost(x):
+    return cfg.C_TERM * (x**2)
+
+def get_initial_distribution(x):
+    return (1 / (np.sqrt(2 * np.pi) * 0.3)) * np.exp(-0.5 * ((x - 1.0) / 0.3)**2)
+
+
+def Al_motion(seed):
+    y = np.zeros(cfg.NT)
+    y[0] = cfg.Y0
+    np.random.seed(seed)
+    for n in range(cfg.NT -1):
+        dW = np.sqrt(dt) * np.random.randn()
+        y[n+1] = y[n] + cfg.SIGMA_AL * dW # This is the discretized brownian motion equation
+
+        # Making sure Al doesn't leave the bar - that would be cheeky
+        if y[n+1] < cfg.X_MIN:
+            y[n+1] = 2 * cfg.X_MIN - y[n+1]
+        if y[n+1] > cfg.X_MAX:
+            y[n+1] = 2 * cfg.X_MAX - y[n+1]
+    
+    return y
+
+
+brownian_al = Al_motion(6742021)
+
+def expo_al_func(c, d, x):
+    A = c - c/(1 - np.exp(-d))
+    B = -c/(1 - np.exp(-d))
+    return (A) - (B) * np.exp(-x)
+
+def solve_hjb_backward(m_field, u_terminal):
+    u = np.zeros((cfg.NT, cfg.NX))
+    u[-1, :] = u_terminal
+    
+    x = np.linspace(cfg.X_MIN, cfg.X_MAX, cfg.NX)
+    base_cost = cfg.C_RUN * (x**2)
+    
+    for n in range(cfg.NT - 2, -1, -1):
+        u_next = u[n + 1, :]
+        t = n * dt
+        
+        wave_arg = np.pi * t + cfg.K * np.abs(x)
+        thirst_cost = cfg.ZETA * (x**2) * (np.cos(wave_arg)**2)
+
+            
+        # Al cost dynamics
+        y_t = brownian_al[n]
+        R_al = 0.2 # sphere of influence
+        dist = np.abs(x - y_t)
+        Al_hotness_factor = expo_al_func(15, R_al, dist)
+
+        # Using mask indexing
+        al_bonus =  np.zeros_like(x)
+        mask = np.abs(x - y_t) < R_al
+        al_bonus[mask] = Al_hotness_factor[mask]
+        
+        d_u_dx = np.zeros_like(u_next)
+        d_u_dx[1:-1] = (u_next[2:] - u_next[:-2]) / (2 * dx)
+        d_u_dx = np.clip(d_u_dx, -10.0, 10.0)
+        
+        d2_u_dx2 = np.zeros_like(u_next)
+        d2_u_dx2[1:-1] = (u_next[2:] - 2 * u_next[1:-1] + u_next[:-2]) / (dx**2)
+        
+        hamiltonian = 0.5 * (d_u_dx**2)
+        congestion = cfg.XI * m_field[n+1, :]
+        
+        change = -hamiltonian + cfg.NU * d2_u_dx2 + congestion + base_cost + thirst_cost - al_bonus
+        
+        u[n, :] = u_next + dt * change
+        u[n, 0] = u[n, 1]
+        u[n, -1] = u[n, -2]
+        
+    return u
+
+def solve_fp_forward(u_field, m_initial):
+    m = np.zeros((cfg.NT, cfg.NX))
+    m[0, :] = m_initial
+    
+    dx_val = (cfg.X_MAX - cfg.X_MIN) / (cfg.NX - 1)
+
+    for n in range(0, cfg.NT - 1):
+        m_curr = m[n, :]
+        u_curr = u_field[n, :]
+        
+        # 1. Calculate Velocity from HJB gradients
+        d_u_dx = np.zeros_like(u_curr)
+        d_u_dx[1:-1] = (u_curr[2:] - u_curr[:-2]) / (2 * dx)
+        
+        # Force zero velocity at boundaries (Reflecting condition)
+        d_u_dx[0] = 0
+        d_u_dx[-1] = 0
+        
+        cfl = 0.8 * (dx / dt)
+        velocity = np.clip(-d_u_dx, -cfl, cfl)
+        
+        # 2. Calculate Fluxes at Cell Faces
+        # Flux[i] is the flow between cell i-1 and cell i
+        flux = np.zeros(cfg.NX + 1)
+        
+        for i in range(1, cfg.NX):
+            v_face = 0.5 * (velocity[i] + velocity[i-1])
+            
+            # Upwind scheme
+            if v_face > 0:
+                val = m_curr[i-1]
+            else:
+                val = m_curr[i]
+                
+            flux[i] = val * v_face
+
+        # Strict Reflecting Boundaries: No flow in or out of the domain
+        flux[0] = 0.0
+        flux[-1] = 0.0 
+        
+        # 3. Advection Update
+        advection_term = np.zeros_like(m_curr)
+        for i in range(cfg.NX):
+            # Net flux into cell i
+            advection_term[i] = -(flux[i+1] - flux[i]) / dx
+
+        # 4. Diffusion Update
+        d2_m_dx2 = np.zeros_like(m_curr)
+        d2_m_dx2[1:-1] = (m_curr[2:] - 2 * m_curr[1:-1] + m_curr[:-2]) / (dx**2)
+        
+        # Mirror boundaries for diffusion (Neumann)
+        d2_m_dx2[0] = 2 * (m_curr[1] - m_curr[0]) / (dx**2)
+        d2_m_dx2[-1] = 2 * (m_curr[-2] - m_curr[-1]) / (dx**2)
+        
+        # 5. Step Update
+        m[n + 1, :] = m_curr + dt * (advection_term + cfg.NU * d2_m_dx2)
+        
+        # Mass Conservation
+        m[n + 1, :] = np.maximum(m[n + 1, :], 0)
+        mass = np.sum(m[n + 1, :]) * dx_val
+        if mass > 1e-9: m[n + 1, :] /= mass
+            
+    return m
+
+print("Running Converging Wave Simulation...")
+m = np.zeros((cfg.NT, cfg.NX))
+m_initial = get_initial_distribution(x_grid)
+u_terminal = get_terminal_cost(x_grid)
+
+# Initialize guess
+for n in range(cfg.NT): m[n, :] = m_initial
+
+for i in range(cfg.MAX_ITER):
+    m_old = m.copy()
+    
+    # Solve HJB (Backward)
+    u = solve_hjb_backward(m, u_terminal)
+    
+    # Solve FP (Forward) - NOW USING CORRECTED FUNCTION
+    m_new = solve_fp_forward(u, m_initial)
+    
+    # Update with smoothing
+    m = (1 - cfg.ALPHA) * m_old + cfg.ALPHA * m_new
+    
+    diff = np.max(np.abs(m - m_old))
+    if i % 10 == 0: print(f"Iter {i}: Diff = {diff:.6f}")
+    if diff < 1e-4: break
+
+print(f"Start Mass: {np.sum(m[0, :])*dx:.4f}")
+print(f"End Mass:   {np.sum(m[-1, :])*dx:.4f}")
+
+# Plotting
+plt.figure(figsize=(14, 10))
+
+plt.subplot(2, 2, 1)
+times = [0, int(cfg.NT*0.33), int(cfg.NT*0.66), cfg.NT-1]
+colors = plt.cm.viridis(np.linspace(0, 1, len(times)))
+for i, idx in enumerate(times):
+    plt.plot(x_grid, m[idx, :], color=colors[i], label=f"t={idx/cfg.NT:.2f}", linewidth=2)
+plt.title("Crowd Density Evolution")
+plt.xlabel("Position x")
+plt.ylabel("Density m(x)")
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(2, 2, 2)
+plt.imshow(m, aspect='auto', cmap='plasma', extent=[cfg.X_MIN, cfg.X_MAX, cfg.T_MAX, cfg.T_MIN])
+plt.colorbar(label='Density')
+plt.title("Crowd Density Heatmap with Al")
+plt.xlabel("Position x")
+plt.ylabel("Time t")
+#over laying Al's path
+time_grid = np.linspace(cfg.T_MIN, cfg.T_MAX, cfg.NT)
+plt.plot(brownian_al, time_grid, color = 'white', linewidth = 1, label = 'Attractive Al')
+plt.grid(False)
+
+cost_grid = np.zeros((cfg.NT, cfg.NX))
+x_vals = np.linspace(cfg.X_MIN, cfg.X_MAX, cfg.NX)
+for n in range(cfg.NT):
+    t_curr = n * dt
+    wave_arg = np.pi * t_curr + cfg.K * np.abs(x_vals)
+    cost_grid[n, :] = (cfg.C_RUN * x_vals**2) + (cfg.ZETA * (x_vals**2) * np.cos(wave_arg)**2)
+
+plt.subplot(2, 1, 2)
+plt.imshow(cost_grid, aspect='auto', cmap='magma', extent=[cfg.X_MIN, cfg.X_MAX, cfg.T_MAX, cfg.T_MIN])
+cbar = plt.colorbar()
+cbar.set_label('Cost', rotation=270, labelpad=15)
+plt.title("Thirst Cost Landscape")
+plt.xlabel("Position x")
+plt.ylabel("Time t")
+
+plt.tight_layout()
+plt.show()
